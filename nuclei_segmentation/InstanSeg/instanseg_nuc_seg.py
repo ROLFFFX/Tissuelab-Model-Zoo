@@ -96,279 +96,16 @@ class SlideSegmentation:
                     actual_model_device = str(model_params[0].device)
                     print(f"InstanSeg model device: {actual_model_device}")
                     if device_str == "mps" and actual_model_device != "mps":
-                        print(f"⚠️  WARNING: Model is on {actual_model_device} but should be on mps!")
+                        print(f"[WARNING] Model is on {actual_model_device} but should be on mps!")
                 
                 # CRITICAL: Check if model is TorchScript (ScriptModule)
                 import torch
                 if isinstance(self.instanseg.instanseg, torch.jit.ScriptModule):
-                    print(f"⚠️  CRITICAL: Model is TorchScript (ScriptModule)!")
-                    print(f"⚠️  TorchScript has poor MPS support - this is why inference is slow!")
-                    print(f"⚠️  TorchScript may fallback to CPU during execution even if parameters are on MPS")
-                    print(f"⚠️  Recommendation: Use smaller tiles (512x512) or multi-process parallel processing")
-                    print(f"⚠️  See TORCHSCRIPT_MPS_ISSUE.md for details and solutions")
-            
-            # Monkey patch INSTANCE method (not class method) to fix MPS support
-            # Problem 1: autocast('cuda') is hardcoded - should use device-specific autocast
-            # Problem 2: .cpu() is called at the end - should keep on device when possible
-            if device_str == "mps" or (device_str is None and torch.backends.mps.is_available()):
-                # Store original method and instance reference
-                original_eval_small_image = self.instanseg.eval_small_image
-                instanseg_instance = self.instanseg  # Capture instance for closure
-                verbosity_level = self.verbosity  # Capture verbosity
-                
-                def patched_eval_small_image(self, image, pixel_size=None, normalise=True, 
-                                            return_image_tensor=True, target="all_outputs", 
-                                            rescale_output=True, **kwargs):
-                    """Patched version that properly supports MPS"""
-                    from instanseg.utils.utils import percentile_normalize, _filter_kwargs
-                    from instanseg.utils.pytorch_utils import _to_tensor_float32, _to_ndim
-                    from torch.nn.functional import interpolate
-                    
-                    # Use the captured instance (self is the InstanSeg instance, but we use captured one)
-                    instanseg_inst = instanseg_instance
-                    
-                    image = _to_tensor_float32(image)
-                    image = _to_ndim(image, 4)
-                    
-                    if "channel_ids" in kwargs:
-                        assert max(kwargs["channel_ids"]) <= image.shape[1], f"Number of channel ids {(kwargs['channel_ids'])} does not match number of channels in image {image.shape[1]}."
-                        image = image[:,kwargs["channel_ids"]]
-                    
-                    original_shape = image.shape
-                    
-                    if pixel_size is not None:
-                        from instanseg.inference_class import _rescale_to_pixel_size
-                        image = _rescale_to_pixel_size(image, pixel_size, instanseg_inst.instanseg.pixel_size)
-                        
-                        if original_shape[-2] != image.shape[-2] or original_shape[-1] != image.shape[-1]:
-                            img_has_been_rescaled = True
-                        else:
-                            img_has_been_rescaled = False
-                    
-                    # Move image to inference device
-                    image = image.to(instanseg_inst.inference_device)
-                    
-                    assert image.dim() ==3 or image.dim() == 4, f"Input image shape {image.shape} is not supported."
-                    
-                    if normalise:
-                        image = _to_ndim(image, 4)
-                        image = torch.stack([percentile_normalize(i) for i in image])
-                    
-                    if target != "all_outputs" and instanseg_inst.instanseg.cells_and_nuclei:
-                        assert target in ["nuclei", "cells"], "Target must be 'nuclei', 'cells' or 'all_outputs'."
-                        if target == "nuclei":
-                            target_segmentation = torch.tensor([1,0])
-                        else:
-                            target_segmentation = torch.tensor([0,1])
-                    else:
-                        target_segmentation = torch.tensor([1,1])
-                    
-                    # FIX: Use device-specific autocast instead of hardcoded 'cuda'
-                    # Note: PyTorch autocast only supports 'cuda' and 'cpu', not 'mps'
-                    # For MPS, we should not use autocast or use 'cpu' mode
-                    device_str_internal = str(instanseg_inst.inference_device)
-                    if device_str_internal.startswith('cuda'):
-                        autocast_device = 'cuda'
-                        use_autocast = True
-                    elif device_str_internal == 'mps':
-                        # MPS doesn't support autocast, run without it for better performance
-                        use_autocast = False
-                        autocast_device = None
-                    else:
-                        autocast_device = 'cpu'
-                        use_autocast = True
-                    
-                    # Debug: print device info (only for first few tiles to reduce overhead)
-                    if verbosity_level > 0 and not hasattr(patched_eval_small_image, '_debug_count'):
-                        patched_eval_small_image._debug_count = 0
-                    if verbosity_level > 0:
-                        debug_count = getattr(patched_eval_small_image, '_debug_count', 0)
-                        if debug_count < 3:  # Only print first 3 times
-                            print(f"[PATCH DEBUG] inference_device: {device_str_internal}, use_autocast: {use_autocast}")
-                            model_params = list(instanseg_inst.instanseg.parameters())
-                            if len(model_params) > 0:
-                                print(f"[PATCH DEBUG] Model device: {model_params[0].device}, Image device: {image.device}")
-                            patched_eval_small_image._debug_count = debug_count + 1
-                    
-                    instanseg_kwargs = _filter_kwargs(instanseg_inst.instanseg, kwargs)
-                    instanseg_kwargs["target_segmentation"] = target_segmentation
-                    
-                    # DEEP PROFILING: Add hooks to monitor model forward pass
-                    forward_times = {}
-                    forward_hooks = []
-                    
-                    def make_hook(name):
-                        def hook(module, input, output):
-                            if hasattr(output, 'device'):
-                                device_str = str(output.device)
-                            else:
-                                device_str = 'unknown'
-                            forward_times[name] = {
-                                'device': device_str,
-                                'shape': str(output.shape) if hasattr(output, 'shape') else 'unknown'
-                            }
-                        return hook
-                    
-                    # Register hooks on first few layers to see where time is spent
-                    if verbosity_level > 0 and not hasattr(patched_eval_small_image, '_hooks_registered'):
-                        try:
-                            # Try to register hooks on model layers
-                            if hasattr(instanseg_inst.instanseg, 'named_modules'):
-                                for name, module in list(instanseg_inst.instanseg.named_modules())[:5]:  # First 5 modules
-                                    if len(name) > 0:  # Skip root
-                                        hook = module.register_forward_hook(make_hook(name))
-                                        forward_hooks.append(hook)
-                            patched_eval_small_image._hooks_registered = True
-                        except Exception as e:
-                            if verbosity_level > 0:
-                                print(f"[PROF] Could not register hooks: {e}")
-                    
-                    # Measure model forward pass in detail
-                    import time
-                    forward_start = time.time()
-                    
-                    # CRITICAL TEST: Check if model is actually using MPS
-                    # Create a test tensor on MPS and see if operations work
-                    test_mps_works = False
-                    if str(instanseg_inst.inference_device) == 'mps':
-                        try:
-                            test_tensor = torch.randn(1, 3, 10, 10, device='mps')
-                            test_result = torch.nn.functional.conv2d(test_tensor, torch.randn(1, 3, 3, 3, device='mps'))
-                            test_mps_works = True
-                        except Exception as e:
-                            if verbosity_level > 0 and debug_count < 3:
-                                print(f"[DEEP PROF] MPS test failed: {e}")
-                    
-                    # Synchronize before forward pass
-                    if str(instanseg_inst.inference_device) == 'mps':
-                        torch.mps.synchronize()
-                    
-                    forward_pre_sync = time.time()
-                    
-                    # Check intermediate tensor devices during forward pass
-                    intermediate_devices = []
-                    def track_device_hook(name):
-                        def hook(module, input, output):
-                            if isinstance(output, torch.Tensor):
-                                intermediate_devices.append((name, str(output.device)))
-                        return hook
-                    
-                    # Register a hook to track device usage
-                    if verbosity_level > 0 and debug_count < 3:
-                        try:
-                            # Register hook on first encoder layer
-                            if hasattr(instanseg_inst.instanseg, 'encoder') and len(instanseg_inst.instanseg.encoder) > 0:
-                                hook = instanseg_inst.instanseg.encoder[0].register_forward_hook(track_device_hook('encoder_0'))
-                                forward_hooks.append(hook)
-                        except:
-                            pass
-                    
-                    if use_autocast:
-                        with torch.amp.autocast(autocast_device):
-                            instances = instanseg_inst.instanseg(image, **instanseg_kwargs)
-                    else:
-                        # MPS: run without autocast for better performance
-                        instances = instanseg_inst.instanseg(image, **instanseg_kwargs)
-                    
-                    forward_post_call = time.time()
-                    
-                    # Synchronize after forward pass
-                    if str(instanseg_inst.inference_device) == 'mps':
-                        torch.mps.synchronize()
-                    
-                    forward_end = time.time()
-                    
-                    # Check intermediate device usage
-                    if intermediate_devices and verbosity_level > 0 and debug_count < 3:
-                        print(f"[DEEP PROF] Intermediate tensor devices: {intermediate_devices[:3]}")  # First 3
-                        cpu_count = sum(1 for _, d in intermediate_devices if d == 'cpu')
-                        mps_count = sum(1 for _, d in intermediate_devices if 'mps' in d)
-                        if cpu_count > mps_count:
-                            print(f"  ⚠️  WARNING: More CPU tensors ({cpu_count}) than MPS tensors ({mps_count})!")
-                            print(f"  ⚠️  This suggests the model is running on CPU, not MPS!")
-                    
-                    # Remove hooks
-                    for hook in forward_hooks:
-                        hook.remove()
-                    forward_hooks.clear()
-                    
-                    forward_times['total'] = forward_end - forward_start
-                    forward_times['pre_sync'] = forward_pre_sync - forward_start
-                    forward_times['forward_call'] = forward_post_call - forward_pre_sync
-                    forward_times['post_sync'] = forward_end - forward_post_call
-                    forward_times['output_device'] = str(instances.device)
-                    
-                    # Print detailed profiling for first few calls
-                    debug_count = getattr(patched_eval_small_image, '_debug_count', 0)
-                    if verbosity_level > 0 and debug_count < 3:
-                        print(f"[DEEP PROF] Model forward pass breakdown:")
-                        print(f"  Total time: {forward_times['total']:.4f}s")
-                        print(f"  Pre-sync: {forward_times['pre_sync']:.4f}s")
-                        print(f"  Forward call: {forward_times['forward_call']:.4f}s")
-                        print(f"  Post-sync: {forward_times['post_sync']:.4f}s")
-                        print(f"  Output device: {forward_times['output_device']}")
-                        
-                        # Check if model is actually using MPS
-                        if forward_times['forward_call'] > 1.0:
-                            print(f"  ⚠️  WARNING: Forward call took {forward_times['forward_call']:.4f}s - this is very slow!")
-                            print(f"  ⚠️  This suggests the model may not be using MPS effectively")
-                            print(f"  ⚠️  Possible causes:")
-                            print(f"      - Model operations not supported on MPS (fallback to CPU)")
-                            print(f"      - BatchNorm/InstanceNorm issues on MPS")
-                            print(f"      - Model too large for MPS memory")
-                            print(f"      - MPS driver/backend issues")
-                        
-                        # Check for CPU fallback
-                        if forward_times['output_device'] == 'cpu' and str(instanseg_inst.inference_device) == 'mps':
-                            print(f"  ⚠️  CRITICAL: Model output is on CPU despite using MPS!")
-                            print(f"  ⚠️  This means the model forward pass is running on CPU")
-                            print(f"  ⚠️  This is why inference is slow!")
-                        
-                        # Performance comparison
-                        tile_area = image.shape[-1] * image.shape[-2] if len(image.shape) >= 2 else 0
-                        if tile_area > 0:
-                            pixels_per_sec = tile_area / forward_times['forward_call'] if forward_times['forward_call'] > 0 else 0
-                            print(f"  Performance: {pixels_per_sec/1e6:.2f} MPixels/sec")
-                            if pixels_per_sec < 1e6:  # Less than 1 MPixel/sec
-                                print(f"  ⚠️  Very slow performance - likely running on CPU")
-                    
-                    # CRITICAL FIX: Model output might be on CPU even though model is on MPS
-                    # Force output back to MPS if it's on CPU but we're using MPS
-                    if str(instanseg_inst.inference_device) == 'mps' and str(instances.device) == 'cpu':
-                        # Only print debug message for first few times to reduce overhead
-                        debug_count = getattr(patched_eval_small_image, '_debug_count', 0)
-                        if verbosity_level > 0 and debug_count < 3:
-                            print(f"[PATCH DEBUG] Model output is on CPU, moving to MPS...")
-                        instances = instances.to('mps')
-                    
-                    if pixel_size is not None and img_has_been_rescaled and rescale_output:  
-                        instances = interpolate(instances, size=original_shape[-2:], mode="nearest")
-                        # Ensure interpolate output stays on MPS
-                        if str(instanseg_inst.inference_device) == 'mps' and str(instances.device) != 'mps':
-                            instances = instances.to('mps')
-                        
-                        if return_image_tensor:
-                            image = interpolate(image, size=original_shape[-2:], mode="bilinear")
-                            # Ensure interpolate output stays on MPS
-                            if str(instanseg_inst.inference_device) == 'mps' and str(image.device) != 'mps':
-                                image = image.to('mps')
-                    
-                    # FIX: Don't force .cpu() - keep on device to avoid unnecessary transfers
-                    # The caller will handle CPU transfer if needed (e.g., for numpy conversion)
-                    # Only print debug message for first few times to reduce overhead
-                    debug_count = getattr(patched_eval_small_image, '_debug_count', 0)
-                    if verbosity_level > 0 and debug_count < 3:
-                        print(f"[PATCH DEBUG] Output device before return: {instances.device}")
-                    
-                    if return_image_tensor:
-                        return instances, image  # Keep on device
-                    else:
-                        return instances  # Keep on device
-                
-                # Apply the monkey patch to the INSTANCE
-                import types
-                self.instanseg.eval_small_image = types.MethodType(patched_eval_small_image, self.instanseg)
-                print("✅ Applied monkey patch to InstanSeg INSTANCE.eval_small_image for MPS support")
+                    print(f"[CRITICAL] Model is TorchScript (ScriptModule)!")
+                    print(f"[CRITICAL] TorchScript has poor MPS support - this is why inference is slow!")
+                    print(f"[CRITICAL] TorchScript may fallback to CPU during execution even if parameters are on MPS")
+                    print(f"[CRITICAL] Recommendation: Use smaller tiles (512x512) or multi-process parallel processing")
+                    print(f"[CRITICAL] See TORCHSCRIPT_MPS_ISSUE.md for details and solutions")
             
             # Force model to use MPS if available (InstanSeg might not automatically use it)
             import torch
@@ -418,7 +155,15 @@ class SlideSegmentation:
                 except Exception as e:
                     print(f"Warning: Could not force MPS device: {e}")
                     import traceback
-                    print(traceback.format_exc())
+                    import sys
+                    try:
+                        print(traceback.format_exc())
+                    except UnicodeEncodeError:
+                        # Fallback for Windows GBK encoding issues
+                        exc_info = sys.exc_info()
+                        tb_str = traceback.format_exception(*exc_info)
+                        safe_tb = ''.join(tb_str).encode('ascii', 'replace').decode('ascii')
+                        print(safe_tb)
             
             # Verify the device being used
             if hasattr(self.instanseg, 'model') and self.instanseg.model is not None:
@@ -448,7 +193,16 @@ class SlideSegmentation:
         except Exception as e:
             print(f"Error initializing InstanSeg: {e}")
             import traceback
-            print(traceback.format_exc())
+            import sys
+            try:
+                print(traceback.format_exc())
+            except UnicodeEncodeError:
+                # Fallback for Windows GBK encoding issues
+                exc_info = sys.exc_info()
+                tb_str = traceback.format_exception(*exc_info)
+                # Replace problematic Unicode characters
+                safe_tb = ''.join(tb_str).encode('ascii', 'replace').decode('ascii')
+                print(safe_tb)
             raise
         
         # Initialize z-stack related attributes

@@ -149,11 +149,10 @@ def run_segmentation(args):
             print(f"Working on {args.slidepath} with InstanSeg model={args.instanseg_model}")
             
             # Initialize InstanSeg segmentation
-            # Use 1024 tile size for better MPS performance (4x faster than 2048)
             ss = SlideSegmentation(
                 args,
-                tile_size=1024,  # Optimized for MPS: 1024 is 4x faster than 2048
-                overlap=128,     # Reduced overlap for smaller tiles
+                tile_size=2048,  # Tile size for processing
+                overlap=224,     # Overlap between tiles
                 model_name=getattr(args, 'instanseg_model', 'brightfield_nuclei'),
                 image_reader=getattr(args, 'image_reader', 'tiffslide'),
                 verbosity=1,
@@ -261,8 +260,16 @@ def run_segmentation(args):
 
     except Exception as e:
         import traceback
+        import sys
         print(f"Error: {str(e)}")
-        print(traceback.format_exc())
+        try:
+            print(traceback.format_exc())
+        except UnicodeEncodeError:
+            # Fallback for Windows GBK encoding issues
+            exc_info = sys.exc_info()
+            tb_str = traceback.format_exception(*exc_info)
+            safe_tb = ''.join(tb_str).encode('ascii', 'replace').decode('ascii')
+            print(safe_tb)
         return {"status": "error", "message": str(e), "nuclei_count": 0}
 
 
