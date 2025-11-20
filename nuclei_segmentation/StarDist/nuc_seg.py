@@ -9,8 +9,13 @@ import matplotlib.pyplot as plt
 from skimage import morphology
 import numpy as np
 import pandas as pd
+try:
+    from numpy.core._exceptions import _ArrayMemoryError as NumpyArrayMemoryError
+except Exception:
+    NumpyArrayMemoryError = MemoryError
 import time
 import copy
+import gc
 from PIL import Image, ImageOps, ImageDraw
 import cv2
 import skimage
@@ -36,10 +41,12 @@ class SlideSegmentation():
                  overlap=224,
                  prob_thresh=0.3,
                  nms_thresh=0.3,
-                 n_tiles=(2,2,1),
+                 n_tiles=(1,1,1),
                  stardist_pretrain='2D_versatile_he',
                  isIHC=False,
-                 progress_callback=None
+                 progress_callback=None,
+                 zarr_path=None,
+                 node_name=None
                  ):
         
         super(SlideSegmentation, self).__init__()
@@ -93,14 +100,19 @@ class SlideSegmentation():
         
         self.wsi_mask = self.simple_get_mask()
         
-        # Load model from local path instead of downloading
-        local_model_path = os.path.join(os.path.dirname(__file__), 'models', stardist_pretrain)
-        if os.path.exists(local_model_path):
-            print(f"Loading StarDist model from local path: {local_model_path}")
-            self.model = StarDist2D(None, name=stardist_pretrain, basedir=os.path.join(os.path.dirname(__file__), 'models'))
-        else:
-            print(f"Local model not found at {local_model_path}, attempting to download...")
-            self.model = StarDist2D.from_pretrained(stardist_pretrain)
+        # Configure model loading parameters for future resets
+        self._stardist_pretrain = stardist_pretrain
+        self._model_basedir = os.path.join(os.path.dirname(__file__), 'models')
+        self._local_model_path = os.path.join(self._model_basedir, stardist_pretrain)
+        self._local_model_available = os.path.exists(self._local_model_path)
+        self._load_stardist_model(verbose=True)
+
+        # VRAM management counters
+        self._tiles_since_model_reset = 0
+        self._pixels_since_model_reset = 0
+        self.model_reset_interval = getattr(args, 'model_reset_interval', 50)
+        self.model_reset_pixel_threshold = getattr(args, 'model_reset_pixel_threshold', 800_000_000)
+        self.model_reset_time_threshold = getattr(args, 'model_reset_time_threshold', 3.0)
         
         self.level = 0
         try:
@@ -141,7 +153,7 @@ class SlideSegmentation():
                 scale_factor = (max_workers / requested_workers) ** 0.5
                 new_n0 = max(2, int(n_tiles[0] * scale_factor))
                 new_n1 = max(2, int(n_tiles[1] * scale_factor))
-                self.n_tiles = (new_n0, new_n1, 1)
+                self.n_tiles = (1,1,1)
                 actual_workers = new_n0 * new_n1
                 print(f"Scaled n_tiles from {n_tiles} to {self.n_tiles} ({requested_workers} -> {actual_workers} workers)")
             else:
@@ -152,8 +164,15 @@ class SlideSegmentation():
             print(f"Using n_tiles={n_tiles}")
             
         self.isIHC = isIHC
+        self._adaptive_n_tiles = self.n_tiles
+        self.max_tile_split = getattr(args, 'max_tile_split', 8)
+        self.max_tiling_attempts = max(1, getattr(args, 'tiling_retry_limit', 4))
         
         self.progress_callback = progress_callback  # Store the reference to progress callback
+
+        # Zarr configuration for direct writing
+        self.zarr_path = zarr_path
+        self.node_name = node_name
 
         # Pre-define feature names (no need to compute first nucleus separately)
         self.feature_names = [
@@ -198,6 +217,128 @@ class SlideSegmentation():
                     print(f"ROI polygon: {len(self.roi_polygon)} vertices")
             except Exception as e:
                 print(f"Warning: Failed to parse polygon_points: {e}")
+
+    def _load_stardist_model(self, verbose=False):
+        """Load StarDist model either from local path or via download."""
+        if self._local_model_available:
+            if verbose:
+                print(f"Loading StarDist model from local path: {self._local_model_path}")
+            self.model = StarDist2D(None,
+                                    name=self._stardist_pretrain,
+                                    basedir=self._model_basedir)
+        else:
+            if verbose:
+                print(f"Local model not found at {self._local_model_path}, attempting to download...")
+            self.model = StarDist2D.from_pretrained(self._stardist_pretrain)
+
+    def _reset_stardist_model(self, reason="manual"):
+        """Forcefully reset the StarDist model to release GPU memory."""
+        print(f"[VRAM] Resetting StarDist model ({reason}) to release GPU memory")
+        try:
+            del self.model
+        except AttributeError:
+            pass
+
+        if hasattr(tf, 'keras') and hasattr(tf.keras, 'backend'):
+            tf.keras.backend.clear_session()
+
+        gc.collect()
+        self._load_stardist_model(verbose=False)
+        self._tiles_since_model_reset = 0
+        self._pixels_since_model_reset = 0
+
+    def _maybe_reset_model(self, predict_duration, img_pixels):
+        """Decide whether to reset the model based on workload heuristics."""
+        self._tiles_since_model_reset += 1
+        self._pixels_since_model_reset += img_pixels
+
+        needs_reset = False
+        reasons = []
+
+        if self._tiles_since_model_reset >= self.model_reset_interval:
+            needs_reset = True
+            reasons.append(f"{self._tiles_since_model_reset} tiles since last reset")
+
+        if self._pixels_since_model_reset >= self.model_reset_pixel_threshold:
+            needs_reset = True
+            reasons.append(f"{self._pixels_since_model_reset:,} pixels processed")
+
+        if predict_duration >= self.model_reset_time_threshold:
+            needs_reset = True
+            reasons.append(f"slow predict ({predict_duration:.2f}s)")
+
+        if needs_reset:
+            reason_text = ", ".join(reasons)
+            self._reset_stardist_model(reason_text)
+
+    def _expand_n_tiles(self, current_tiles):
+        """Increase n_tiles along spatial axes to lower memory footprint."""
+        if not isinstance(current_tiles, (tuple, list)):
+            tiles = [int(current_tiles)]
+        else:
+            tiles = list(current_tiles)
+
+        while len(tiles) < 2:
+            tiles.append(1)
+
+        updated = False
+        for idx in range(min(2, len(tiles))):
+            if tiles[idx] < self.max_tile_split:
+                tiles[idx] *= 2
+                updated = True
+
+        if not updated:
+            return None
+
+        return tuple(tiles)
+
+    def _adaptive_predict_instances(self, img_norm, **predict_kwargs):
+        """Call predict_instances with automatic tiling fallback on OOM."""
+        current_tiles = getattr(self, "_adaptive_n_tiles", self.n_tiles)
+        exception_types = [MemoryError]
+
+        resource_error = getattr(getattr(tf, "errors", None), "ResourceExhaustedError", None)
+        if resource_error:
+            exception_types.append(resource_error)
+        if NumpyArrayMemoryError is not MemoryError:
+            exception_types.append(NumpyArrayMemoryError)
+
+        exception_types = tuple(exception_types)
+
+        attempt = 0
+        while attempt < self.max_tiling_attempts:
+            try:
+                result = self.model.predict_instances(
+                    img_norm,
+                    prob_thresh=self.prob_thresh,
+                    nms_thresh=self.nms_thresh,
+                    n_tiles=current_tiles,
+                    **predict_kwargs
+                )
+                self._adaptive_n_tiles = current_tiles
+                return result
+            except exception_types as exc:
+                attempt += 1
+                print(f"[StarDist] predict_instances OOM with n_tiles={current_tiles}: {exc}")
+                next_tiles = self._expand_n_tiles(current_tiles)
+                if next_tiles is None or attempt >= self.max_tiling_attempts:
+                    print("[StarDist] Adaptive tiling exhausted. Re-raising memory error.")
+                    raise
+                print(f"[StarDist] Retrying predict_instances with n_tiles={next_tiles}")
+                current_tiles = next_tiles
+
+    def _pad_tile_to_size(self, img_np, target_w, target_h, pad_value=255):
+        """Pad tile to fixed size so TensorFlow sees static input shapes."""
+        h, w = img_np.shape[:2]
+        if h == target_h and w == target_w:
+            return img_np, w, h
+
+        channels = img_np.shape[2] if img_np.ndim == 3 else 1
+        padded = np.full((target_h, target_w, channels),
+                         pad_value,
+                         dtype=img_np.dtype)
+        padded[:h, :w, ...] = img_np
+        return padded, w, h
         
     def _detect_zstack(self):
         """Detect if the image is a z-stack and determine the middle layer for segmentation"""
@@ -741,11 +882,12 @@ class SlideSegmentation():
                 
                 # Time the StarDist prediction to identify GPU vs CPU performance
                 predict_start = time.time()
-                labels, dicts = self.model.predict_instances(img_norm,
+                _, dicts = self.model.predict_instances(img_norm,
                                                         prob_thresh=self.prob_thresh,
                                                         nms_thresh=self.nms_thresh,
                                                         n_tiles=self.n_tiles,
                                                         show_tile_progress=False,
+                                                        return_labels=False,
                                                         return_predict=False
                                                         )
                 predict_duration = time.time() - predict_start
@@ -858,6 +1000,177 @@ class SlideSegmentation():
         
         
 
+    def _init_zarr_datasets(self):
+        """Initialize Zarr datasets for centroids, contours, and probability."""
+        if self.zarr_path is None or self.node_name is None:
+            raise ValueError("zarr_path and node_name must be set for direct zarr writing")
+
+        import zarr
+        root = zarr.open_group(self.zarr_path, mode='a')
+
+        # Create parent group if it doesn't exist
+        node_grp = root.require_group(self.node_name)
+
+        # Initialize datasets with initial size 0, will be resized as we add data
+        self.centroids_dset = node_grp.create_dataset(
+            'centroids',
+            shape=(0, 2),
+            chunks=(1000, 2),
+            dtype=np.int32
+        )
+
+        self.contours_dset = node_grp.create_dataset(
+            'contours',
+            shape=(0, 2, 0),  # Will be resized when we know max contour length
+            chunks=(100, 2, 100),
+            dtype=np.int32
+        )
+
+        self.prob_dset = node_grp.create_dataset(
+            'probability',
+            shape=(0,),
+            chunks=(1000,),
+            dtype=np.float32
+        )
+
+        print(f"Initialized Zarr datasets for node '{self.node_name}'")
+
+    def _append_to_zarr(self, centroids, contours, prob):
+        """Append segmentation results as a batch to Zarr datasets for better performance."""
+        if len(centroids) == 0:
+            return  # Nothing to append
+
+        # Append centroids as batch
+        current_centroid_size = self.centroids_dset.shape[0]
+        new_centroid_size = current_centroid_size + len(centroids)
+        self.centroids_dset.resize((new_centroid_size, 2))
+        self.centroids_dset[current_centroid_size:new_centroid_size, :] = centroids
+
+        # Append contours as batch
+        current_contour_size = self.contours_dset.shape[0]
+        new_contour_size = current_contour_size + len(centroids)
+
+        # Check if we need to resize the contour length dimension
+        contour_points = contours.shape[2] if len(contours.shape) == 3 else 0
+        current_max_len = self.contours_dset.shape[2]
+
+        if contour_points > current_max_len:
+            # Resize contour length dimension for all existing data
+            self.contours_dset.resize((current_contour_size, 2, contour_points))
+
+        # Resize for new contours
+        self.contours_dset.resize((new_contour_size, 2, self.contours_dset.shape[2]))
+
+        # Write contours batch
+        if len(contours) > 0 and contour_points > 0:
+            self.contours_dset[current_contour_size:new_contour_size, :, :contour_points] = contours
+
+        # Append probabilities as batch
+        current_prob_size = self.prob_dset.shape[0]
+        new_prob_size = current_prob_size + len(prob)
+        self.prob_dset.resize((new_prob_size,))
+        self.prob_dset[current_prob_size:new_prob_size] = prob
+
+    def _post_process_zarr_data(self):
+        """Apply post-processing (deduplication, ROI filtering) directly on zarr data."""
+        import zarr
+
+        # Read all data from zarr
+        centroids = self.centroids_dset[:]
+        contours = self.contours_dset[:]
+        prob = self.prob_dset[:]
+
+        print(f"Loaded {len(centroids)} nuclei from zarr for post-processing")
+
+        if len(centroids) == 0:
+            return 0
+
+        # Apply deduplication
+        print("Applying deduplication...")
+        # Efficient distance-based deduplication using KDTree
+        from scipy.spatial import KDTree
+        if len(centroids) > 1:
+            # Build KDTree for efficient spatial queries
+            tree = KDTree(centroids)
+            # Keep nuclei that are at least 5 pixels apart
+            min_distance = 5
+            keep_mask = np.ones(len(centroids), dtype=bool)
+
+            for i in range(len(centroids)):
+                if keep_mask[i]:
+                    # Query points within min_distance, excluding the point itself
+                    indices = tree.query_ball_point(centroids[i], min_distance)
+                    # Remove indices that are <= i (already processed or current point)
+                    close_indices = [idx for idx in indices if idx > i]
+                    # Mark these points for removal
+                    for idx in close_indices:
+                        keep_mask[idx] = False
+
+            n_before_dedup = len(centroids)
+            centroids = centroids[keep_mask]
+            if len(contours) > 0:
+                contours = contours[keep_mask]
+            if len(prob) > 0:
+                prob = prob[keep_mask]
+            n_after_dedup = len(centroids)
+            print(f"Deduplication: {n_before_dedup} -> {n_after_dedup} nuclei ({n_before_dedup - n_after_dedup} removed)")
+
+        print(f"After deduplication: {len(centroids)} nuclei")
+
+        # Apply ROI filtering
+        if self.roi_polygon is not None:
+            print("Applying polygon ROI filtering...")
+            x_coords = centroids[:, 0]
+            y_coords = centroids[:, 1]
+
+            within_roi = np.array([self.point_in_polygon(x, y, self.roi_polygon)
+                                  for x, y in zip(x_coords, y_coords)])
+
+            n_before = len(centroids)
+            centroids = centroids[within_roi]
+            if len(contours) > 0:
+                contours = contours[within_roi]
+            if len(prob) > 0:
+                prob = prob[within_roi]
+            n_after = len(centroids)
+
+            print(f"ROI polygon filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
+
+        elif self.roi_bbox is not None:
+            print("Applying bbox ROI filtering...")
+            roi_x0, roi_y0, roi_x1, roi_y1 = self.roi_bbox
+            x_coords = centroids[:, 0]
+            y_coords = centroids[:, 1]
+            within_roi = (x_coords >= roi_x0) & (x_coords <= roi_x1) & (y_coords >= roi_y0) & (y_coords <= roi_y1)
+
+            n_before = len(centroids)
+            centroids = centroids[within_roi]
+            if len(contours) > 0:
+                contours = contours[within_roi]
+            if len(prob) > 0:
+                prob = prob[within_roi]
+            n_after = len(centroids)
+
+            print(f"ROI bbox filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
+
+        # Write final results back to zarr
+        root = zarr.open_group(self.zarr_path, mode='a')
+        node_grp = root[self.node_name]
+
+        # Clear and rewrite datasets
+        for dataset_name in ['centroids', 'contours', 'probability']:
+            if dataset_name in node_grp:
+                del node_grp[dataset_name]
+
+        if len(centroids) > 0:
+            node_grp.create_dataset('centroids', data=centroids)
+            if len(contours) > 0:
+                node_grp.create_dataset('contours', data=contours)
+            if len(prob) > 0:
+                node_grp.create_dataset('probability', data=prob)
+
+        return len(centroids)
+
     def run_WSI_segmentation(self):
         '''
         For a 500x500 patch,
@@ -877,7 +1190,11 @@ class SlideSegmentation():
         total_postprocess_time = 0
         
         self.normalize_template = self.get_normalized_template()
-        
+
+        # Initialize Zarr datasets if direct writing is enabled
+        if self.zarr_path is not None and self.node_name is not None:
+            self._init_zarr_datasets()
+
         # Check file extension, for PNG/JPG/JPEG formats directly process the entire image
         file_extension = os.path.splitext(self.args.slidepath)[1].lower()
         simple_image_formats = ['.png', '.jpg', '.jpeg', '.bmp']
@@ -932,12 +1249,13 @@ class SlideSegmentation():
                     self.progress_callback(50)
                     
                 # Direct segmentation
-                labels, dicts = self.model.predict_instances(img_norm,
-                                                           prob_thresh=self.prob_thresh,
-                                                           nms_thresh=self.nms_thresh,
-                                                           n_tiles=self.n_tiles,
-                                                           show_tile_progress=False,
-                                                           return_predict=False)
+                _, dicts = self.model.predict_instances(img_norm,
+                                                       prob_thresh=self.prob_thresh,
+                                                       nms_thresh=self.nms_thresh,
+                                                       n_tiles=self.n_tiles,
+                                                       show_tile_progress=False,
+                                                       return_labels=False,
+                                                       return_predict=False)
                                                             
                 if self.progress_callback:
                     self.progress_callback(80)
@@ -952,62 +1270,81 @@ class SlideSegmentation():
                 
                 prob = dicts['prob']
                 
-                # Set final results - fix contours processing
-                self.final_points = points.astype(np.int32)
-                self.final_coord = coord.astype(np.int32)
-                # Ensure final_coord has dimensions (n, m, 2)
-                self.final_coord = np.swapaxes(self.final_coord, 1, 2)
-                self.prob_all = prob
-                
-                # Scale coordinates back to original image space if we resized
-                if resize_factor is not None:
-                    self.final_points = (self.final_points / resize_factor).astype(np.int32)
-                    self.final_coord = (self.final_coord / resize_factor).astype(np.int32)
-                
-                # Apply post-processing for simple images too
-                self.post_process_remove_duplicates_fixed(debug=False)
-                
-                print(f"After deduplication: {len(self.final_points)} nuclei")
-                
-                # Filter centroids to ROI if specified
-                if self.roi_polygon is not None:
-                    # Use polygon for filtering
-                    x_coords = self.final_points[:, 0]
-                    y_coords = self.final_points[:, 1]
-                    
-                    # Check each point against polygon
-                    within_roi = np.array([self.point_in_polygon(x, y, self.roi_polygon) 
-                                          for x, y in zip(x_coords, y_coords)])
-                    
-                    n_before = len(self.final_points)
-                    self.final_points = self.final_points[within_roi]
-                    self.final_coord = self.final_coord[within_roi]
-                    self.prob_all = self.prob_all[within_roi]
-                    n_after = len(self.final_points)
-                    
-                    print(f"ROI polygon filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
-                    
-                elif self.roi_bbox is not None:
-                    # Use bounding box for filtering
-                    bbox_x, bbox_y, bbox_w, bbox_h = self.roi_bbox
-                    roi_x0, roi_y0 = bbox_x, bbox_y
-                    roi_x1, roi_y1 = bbox_x + bbox_w, bbox_y + bbox_h
-                    
-                    x_coords = self.final_points[:, 0]
-                    y_coords = self.final_points[:, 1]
-                    within_roi = (x_coords >= roi_x0) & (x_coords <= roi_x1) & (y_coords >= roi_y0) & (y_coords <= roi_y1)
-                    
-                    n_before = len(self.final_points)
-                    self.final_points = self.final_points[within_roi]
-                    self.final_coord = self.final_coord[within_roi]
-                    self.prob_all = self.prob_all[within_roi]
-                    n_after = len(self.final_points)
-                    
-                    print(f"ROI bbox filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
-                
-                # Get final count after all processing
-                total_nuclei = len(self.final_points)
-                print(f"Total: {total_nuclei} nuclei")
+                # Handle results based on whether we use direct zarr writing
+                if self.zarr_path is not None and self.node_name is not None:
+                    # Write directly to zarr for simple images
+                    centroids_batch = points.astype(np.int32)
+                    contours_batch = coord.astype(np.int32)
+                    contours_batch = np.swapaxes(contours_batch, 1, 2)  # Ensure (n, 2, m) format
+                    prob_batch = prob.astype(np.float32)
+
+                    # Scale coordinates back if we resized
+                    if resize_factor is not None:
+                        centroids_batch = (centroids_batch / resize_factor).astype(np.int32)
+                        contours_batch = (contours_batch / resize_factor).astype(np.int32)
+
+                    # Write to zarr
+                    self._append_to_zarr(centroids_batch, contours_batch, prob_batch)
+
+                    # Apply post-processing directly on zarr data
+                    total_nuclei = self._post_process_zarr_data()
+                else:
+                    # Legacy behavior for simple images
+                    self.final_points = points.astype(np.int32)
+                    self.final_coord = coord.astype(np.int32)
+                    # Ensure final_coord has dimensions (n, m, 2)
+                    self.final_coord = np.swapaxes(self.final_coord, 1, 2)
+                    self.prob_all = prob
+
+                    # Scale coordinates back to original image space if we resized
+                    if resize_factor is not None:
+                        self.final_points = (self.final_points / resize_factor).astype(np.int32)
+                        self.final_coord = (self.final_coord / resize_factor).astype(np.int32)
+
+                    # Apply post-processing for simple images too
+                    self.post_process_remove_duplicates_fixed(debug=False)
+
+                    print(f"After deduplication: {len(self.final_points)} nuclei")
+
+                    # Filter centroids to ROI if specified
+                    if self.roi_polygon is not None:
+                        # Use polygon for filtering
+                        x_coords = self.final_points[:, 0]
+                        y_coords = self.final_points[:, 1]
+
+                        # Check each point against polygon
+                        within_roi = np.array([self.point_in_polygon(x, y, self.roi_polygon)
+                                              for x, y in zip(x_coords, y_coords)])
+
+                        n_before = len(self.final_points)
+                        self.final_points = self.final_points[within_roi]
+                        self.final_coord = self.final_coord[within_roi]
+                        self.prob_all = self.prob_all[within_roi]
+                        n_after = len(self.final_points)
+
+                        print(f"ROI polygon filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
+
+                    elif self.roi_bbox is not None:
+                        # Use bounding box for filtering
+                        bbox_x, bbox_y, bbox_w, bbox_h = self.roi_bbox
+                        roi_x0, roi_y0 = bbox_x, bbox_y
+                        roi_x1, roi_y1 = bbox_x + bbox_w, bbox_y + bbox_h
+
+                        x_coords = self.final_points[:, 0]
+                        y_coords = self.final_points[:, 1]
+                        within_roi = (x_coords >= roi_x0) & (x_coords <= roi_x1) & (y_coords >= roi_y0) & (y_coords <= roi_y1)
+
+                        n_before = len(self.final_points)
+                        self.final_points = self.final_points[within_roi]
+                        self.final_coord = self.final_coord[within_roi]
+                        self.prob_all = self.prob_all[within_roi]
+                        n_after = len(self.final_points)
+
+                        print(f"ROI bbox filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
+
+                    # Get final count after all processing
+                    total_nuclei = len(self.final_points)
+                    print(f"Total: {total_nuclei} nuclei")
                 
                 if self.progress_callback:
                     self.progress_callback(100)
@@ -1119,12 +1456,13 @@ class SlideSegmentation():
                     w_col = x_1 - x_0
                     h_row = y_1 - y_0
                     
-                    tile_size = self.tile_size*resize_factor
+                    tile_size_effective = int(np.round(self.tile_size*resize_factor))
                     overlap = self.overlap*resize_factor
                     dim = (self.dim[0]*resize_factor, self.dim[1]*resize_factor)
-                    normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img.size))
+                    normalize_template = np.array(Image.fromarray(self.normalize_template).resize((tile_size_effective, tile_size_effective)))
                 else:
                     et = time.time()
+                    tile_size_effective = self.tile_size
                     normalize_template = self.normalize_template
 
                 img_np = np.array(img)
@@ -1135,10 +1473,18 @@ class SlideSegmentation():
                     #greyscale
                     img_np = img_np[:, :, np.newaxis]
                 
+                img_np, valid_w, valid_h = self._pad_tile_to_size(
+                    img_np,
+                    tile_size_effective,
+                    tile_size_effective
+                )
+                
                 if self.wsi_mask is not None:
                     help_with_norm = True
                 else:
                     help_with_norm = False
+
+                img_pixels = valid_w * valid_h
 
                 # Track normalization time
                 norm_start_time = time.time()
@@ -1163,13 +1509,14 @@ class SlideSegmentation():
                 
                 # Track StarDist prediction time (the main bottleneck)
                 predict_start_time = time.time()
-                labels, dicts = self.model.predict_instances(img_norm,
-                                                            prob_thresh=self.prob_thresh,
-                                                            nms_thresh=self.nms_thresh,
-                                                            n_tiles=self.n_tiles,
-                                                            show_tile_progress=False,
-                                                            return_predict=False
-                                                            )
+                _, dicts = self.model.predict_instances(img_norm,
+                                                        prob_thresh=self.prob_thresh,
+                                                        nms_thresh=self.nms_thresh,
+                                                        n_tiles=self.n_tiles,
+                                                        show_tile_progress=False,
+                                                        return_labels=False,
+                                                        return_predict=False
+                                                        )
                 predict_end_time = time.time()
                 predict_duration = predict_end_time - predict_start_time
                 total_predict_time += predict_duration
@@ -1180,38 +1527,62 @@ class SlideSegmentation():
                     print(f"    Expected GPU time: 0.5-2s. Check TensorFlow GPU installation!")
                 elif predict_duration < 1.0:
                     print(f"StarDist prediction: {predict_duration:.2f}s (GPU acceleration likely active)")
+
+                # Evaluate whether to reset the model to reclaim GPU memory
+                self._maybe_reset_model(predict_duration, img_pixels)
                                                             
                 points = dicts['points'] # y,x
                 points[:, [1, 0]] = points[:, [0, 1]] # x,y
+                coord = dicts['coord']
+                coord[:, [1, 0], :] = coord[:, [0, 1], :] # x,y
+                prob = dicts['prob']
+                local_points = points.copy()
+
+                valid_mask = (local_points[:, 0] < valid_w) & (local_points[:, 1] < valid_h)
+                if not np.all(valid_mask):
+                    points = points[valid_mask]
+                    coord = coord[valid_mask, ...]
+                    prob = prob[valid_mask]
 
                 points[:,0] += x_0
                 points[:,1] += y_0
                 points = pd.DataFrame(points, index=[(ir, ic)]*len(points), columns=['x','y']).reset_index()
-                coord = dicts['coord']
-                coord[:, [1, 0], :] = coord[:, [0, 1], :] # x,y
                 coord = np.round(coord).astype(np.int32)
                 coord[:,0,:] += x_0
                 coord[:,1,:] += y_0
-                prob = dicts['prob']
                 
                 # Calculate tile processing time
                 patch_end_time = time.time()
                 patch_duration = patch_end_time - patch_start_time
                 compute_duration = patch_duration - read_duration
                 
-                # Log tile results
+                # Calculate timing components
+                norm_duration = norm_end_time - norm_start_time
+                other_time = patch_duration - read_duration - norm_duration - predict_duration
+
+                # Log tile results with detailed timing
                 if len(points) > 0:
                     print(f"Tile r{ir}c{ic}: {len(points)} nuclei ({patch_duration:.2f}s)")
+                    # Detailed timing breakdown for this tile
+                    print(f"  └─ Read: {read_duration:.3f}s | Norm: {norm_duration:.3f}s | Predict: {predict_duration:.3f}s | Other: {other_time:.3f}s")
                 
-                # Note here: correctly accumulate results from all tiles instead of overwriting
-                if points_all is None:
-                    points_all = points
-                    coord_all = coord
-                    prob_all = prob
-                else:
-                    points_all = pd.concat((points_all, points), axis=0, ignore_index=True)
-                    coord_all = np.concatenate((coord_all, coord), axis=0)
-                    prob_all = np.concatenate((prob_all, prob), axis=0)
+                # Handle tile results - either accumulate in memory or write directly to zarr
+                if self.zarr_path is not None and self.node_name is not None:
+                    # Write directly to zarr to avoid memory accumulation
+                    if len(points) > 0:
+                        centroids_batch = points[['x','y']].values.astype(np.int32)
+                        contours_batch = coord.astype(np.int32) if len(coord) > 0 else np.array([])
+                        prob_batch = prob.astype(np.float32) if len(prob) > 0 else np.array([])
+
+                        # Apply coordinate scaling if needed before writing
+                        if hasattr(self, 'mpp_resize_factor') and self.mpp_resize_factor is not None:
+                            centroids_batch = (centroids_batch / self.mpp_resize_factor).astype(np.int32)
+                            contours_batch = (contours_batch / self.mpp_resize_factor).astype(np.int32)
+
+                        # Track Zarr writing time
+                        zarr_start_time = time.time()
+                        self._append_to_zarr(centroids_batch, contours_batch, prob_batch)
+                        zarr_duration = time.time() - zarr_start_time
         
         # Ensure progress reaches 100% after tile processing
         if self.progress_callback:
@@ -1224,15 +1595,20 @@ class SlideSegmentation():
             print(f"   Tiles skipped (outside ROI): {tiles_skipped_roi}")
             print(f"   Tiles processed (inside ROI): {processed_tiles}")
         
-        # Print clear information before generating final_points
-        if points_all is None or len(points_all) == 0:
-            print("Warning: points_all is empty or has length 0!")
-            self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
-            self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
-            self.prob_all = np.array([])
-            total_nuclei = 0
+        # Handle final results based on whether we used direct zarr writing
+        if self.zarr_path is not None and self.node_name is not None:
+            # Direct zarr writing mode - apply post-processing on zarr data
+            total_nuclei = self._post_process_zarr_data()
         else:
-            print(f"Segmentation complete, total accumulated nuclei before deduplication: {len(points_all)}")
+            # Legacy memory accumulation mode
+            if points_all is None or len(points_all) == 0:
+                print("Warning: points_all is empty or has length 0!")
+                self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
+                self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+                self.prob_all = np.array([])
+                total_nuclei = 0
+            else:
+                print(f"Segmentation complete, total accumulated nuclei before deduplication: {len(points_all)}")
             
             # Print first few rows of points_all to verify data
             print(f"points_all first 5 rows sample: \n{points_all.head().to_string()}")
