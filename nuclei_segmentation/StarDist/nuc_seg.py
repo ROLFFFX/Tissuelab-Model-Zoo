@@ -60,6 +60,7 @@ class SlideSegmentation():
         
         # Add GPU check and configure CPU threading
         gpus = tf.config.list_physical_devices('GPU')
+        self.gpus = gpus  # Store for cleanup later
         if gpus:
             try:
                 # Currently, memory growth needs to be the same across GPUs
@@ -220,6 +221,138 @@ class SlideSegmentation():
                     print(f"ROI polygon: {len(self.roi_polygon)} vertices")
             except Exception as e:
                 print(f"Warning: Failed to parse polygon_points: {e}")
+    
+    def _cleanup_tensorflow_session(self):
+        """Clean up TensorFlow session and release GPU memory after segmentation.
+        
+        Note: TensorFlow's BFC allocator may retain memory pools even after cleanup.
+        This method attempts multiple strategies to force memory release.
+        """
+        if self.gpus:
+            try:
+                print("Cleaning up TensorFlow session and releasing GPU memory...")
+                
+                # Step 1: Get memory info before cleanup (for comparison)
+                mem_before = {}
+                try:
+                    if hasattr(tf.config.experimental, 'get_memory_info'):
+                        for gpu in self.gpus:
+                            mem_info = tf.config.experimental.get_memory_info(gpu.name)
+                            mem_before[gpu.name] = mem_info['current'] / 1024**3
+                            print(f"GPU {gpu.name} memory before cleanup: {mem_info['current'] / 1024**3:.2f} GB / {mem_info['peak'] / 1024**3:.2f} GB")
+                except Exception as e:
+                    print(f"Could not get initial memory info: {e}")
+                
+                # Step 2: Delete model reference to release model weights from GPU
+                if hasattr(self, 'model') and self.model is not None:
+                    try:
+                        # Try to delete model's internal TensorFlow graph
+                        if hasattr(self.model, 'keras_model') and self.model.keras_model is not None:
+                            # Delete the underlying Keras model
+                            keras_model = self.model.keras_model
+                            if hasattr(keras_model, '__del__'):
+                                try:
+                                    keras_model.__del__()
+                                except:
+                                    pass
+                            del keras_model
+                            self.model.keras_model = None
+                        
+                        # Delete the StarDist model
+                        if hasattr(self.model, '__del__'):
+                            try:
+                                self.model.__del__()
+                            except:
+                                pass
+                        del self.model
+                        self.model = None
+                    except Exception as e:
+                        print(f"Warning: Error deleting model: {e}")
+                
+                # Step 3: Clear TensorFlow backend session (releases computation graph)
+                tf.keras.backend.clear_session()
+                
+                # Step 4: Force garbage collection multiple times to ensure cleanup
+                import gc
+                gc.collect()
+                gc.collect()  # Call twice to handle circular references
+                
+                # Step 5: Try to reset memory growth to force BFC allocator to release memory
+                # This is a workaround for TensorFlow's BFC allocator retaining memory pools
+                try:
+                    for gpu in self.gpus:
+                        # Temporarily disable memory growth, then re-enable it
+                        # This can force the allocator to release retained memory
+                        try:
+                            tf.config.experimental.set_memory_growth(gpu, False)
+                            tf.config.experimental.set_memory_growth(gpu, True)
+                        except:
+                            # If that fails, just try to reset stats
+                            pass
+                        
+                        # Reset memory stats if available
+                        if hasattr(tf.config.experimental, 'reset_memory_stats'):
+                            try:
+                                tf.config.experimental.reset_memory_stats(gpu)
+                            except:
+                                pass
+                except Exception as e:
+                    print(f"Warning: Error resetting memory growth: {e}")
+                
+                # Step 6: Additional garbage collection after memory reset
+                gc.collect()
+                gc.collect()
+                
+                # Step 7: Try to use TensorFlow's device reset (if available)
+                try:
+                    # Force TensorFlow to release all GPU memory by creating and deleting a dummy operation
+                    with tf.device('/GPU:0'):
+                        dummy = tf.constant(0)
+                        del dummy
+                    tf.keras.backend.clear_session()
+                except:
+                    pass
+                
+                # Step 8: Final garbage collection
+                gc.collect()
+                
+                # Step 9: Verify memory release
+                mem_released = False
+                try:
+                    if hasattr(tf.config.experimental, 'get_memory_info'):
+                        for gpu in self.gpus:
+                            mem_info = tf.config.experimental.get_memory_info(gpu.name)
+                            mem_after = mem_info['current'] / 1024**3
+                            mem_before_gb = mem_before.get(gpu.name, 0)
+                            mem_diff = mem_before_gb - mem_after
+                            
+                            print(f"GPU {gpu.name} memory after cleanup: {mem_after:.2f} GB / {mem_info['peak'] / 1024**3:.2f} GB")
+                            
+                            if mem_before_gb > 0:
+                                if mem_diff > 0.1:  # At least 100MB released
+                                    print(f" Released {mem_diff:.2f} GB of GPU memory")
+                                    mem_released = True
+                                elif mem_after < 0.5:  # Less than 500MB remaining
+                                    print(f" GPU memory is low ({mem_after:.2f} GB)")
+                                    mem_released = True
+                                else:
+                                    print(f"[Warning] GPU memory not fully released (still {mem_after:.2f} GB)")
+                                    print(f"     This is normal - TensorFlow's BFC allocator may retain memory pools.")
+                                    print(f"     Memory will be reused in subsequent operations.")
+                except Exception as e:
+                    print(f"Could not verify memory release: {e}")
+                
+                if mem_released:
+                    print("TensorFlow session cleaned up successfully - GPU memory released.")
+                else:
+                    print("TensorFlow session cleaned up successfully.")
+                    print("Note: Some GPU memory may be retained by TensorFlow's memory allocator.")
+                    print("      This is expected behavior and memory will be reused in future operations.")
+                    
+            except Exception as e:
+                print(f"Warning: Failed to cleanup TensorFlow session: {e}")
+                import traceback
+                traceback.print_exc()
         
     def _detect_zstack(self):
         """Detect if the image is a z-stack and determine the middle layer for segmentation"""
@@ -846,6 +979,8 @@ class SlideSegmentation():
         
         print(f"parallel segmentation results: {self.points_all.shape if self.points_all is not None else 'None'}")
         
+        # Clean up TensorFlow session and release GPU memory
+        self._cleanup_tensorflow_session()
 
     def run_WSI_segmentation_parallel(self):
         '''
@@ -1044,6 +1179,9 @@ class SlideSegmentation():
                 print(f"Total nuclei count: {total_nuclei}")
                 
                 print("---- Segmentation successfully completed ----")
+                
+                # Clean up TensorFlow session and release GPU memory
+                self._cleanup_tensorflow_session()
                 
                 return
                 
@@ -1375,6 +1513,9 @@ class SlideSegmentation():
         
         print(f"{'='*80}")
         print("---- Segmentation successfully completed ----")
+        
+        # Clean up TensorFlow session and release GPU memory
+        self._cleanup_tensorflow_session()
         
         # Add final validation
         print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
