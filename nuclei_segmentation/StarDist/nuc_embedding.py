@@ -1176,23 +1176,32 @@ def _normalize_clip_gpu(tensor, device):
     """Normalize CLIP on GPU using PyTorch (faster than CPU numpy).
     
     Args:
-        tensor: torch.Tensor of shape (N, C, H, W) with float32 values [0, 255] (already converted from uint8)
+        tensor: torch.Tensor of shape (N, C, H, W) with float32 values in [0, 255] range
         device: torch device to use
         
     Returns:
         Normalized tensor of shape (N, C, H, W) with float32 values
+        
+    Note:
+        This function always rescales from [0, 255] to [0, 1] first, then normalizes.
+        This matches processor behavior exactly: rescale -> normalize.
     """
     global _CLIP_MEAN_TENSOR, _CLIP_STD_TENSOR
     
+    # CRITICAL: Processor first rescales (divides by 255), then normalizes
+    # We must match this exact sequence for numerical consistency
+    # Rescale: convert from [0, 255] to [0, 1]
+    tensor = tensor / 255.0
+    
     # Initialize constants on first use (lazy initialization)
     if _CLIP_MEAN_TENSOR is None or _CLIP_MEAN_TENSOR.device != device:
-        _CLIP_MEAN_TENSOR = torch.tensor(_CLIP_MEAN_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-        _CLIP_STD_TENSOR = torch.tensor(_CLIP_STD_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        # Use [0, 1] range mean and std (matching processor after rescale)
+        _CLIP_MEAN_TENSOR = torch.tensor(_CLIP_MEAN, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        _CLIP_STD_TENSOR = torch.tensor(_CLIP_STD, device=device, dtype=torch.float32).view(1, 3, 1, 1)
     
     # OPTIMIZATION: Tensor is already float32 on GPU, so just normalize directly
     # CLIP normalization: (x - mean) / std
     # PyTorch will fuse these operations automatically on GPU
-    # Using in-place operations where possible for better memory efficiency
     normalized = (tensor - _CLIP_MEAN_TENSOR) / _CLIP_STD_TENSOR
     return normalized
 
@@ -1233,11 +1242,12 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
                 arr = arr[:, :, :3]
         elif isinstance(img, np.ndarray):
             # If already numpy array, only convert dtype if needed
-            if img.dtype != np.uint8:
-                arr = img.astype(np.uint8)
-            else:
-                arr = img  # No copy needed if dtype is already uint8
-            # Ensure correct shape
+            # OPTIMIZATION: Avoid unnecessary copy if dtype and shape are already correct
+            arr = img
+            # Only convert dtype if needed
+            if arr.dtype != np.uint8:
+                arr = arr.astype(np.uint8)
+            # Ensure correct shape (only modify if needed)
             if len(arr.shape) == 2:
                 arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
             elif arr.shape[2] == 1:
@@ -1312,7 +1322,10 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
     # Stack all processed images: (N, C, H, W)
     batch_tensor = torch.stack(processed_tensors, dim=0)
     
-    # Step 3: Normalize with CLIP statistics (GPU-accelerated)
+    # Step 3: Rescale and Normalize with CLIP statistics (matching processor behavior exactly)
+    # CRITICAL: Processor first rescales (divides by 255), then normalizes
+    # We must match this exact sequence for numerical consistency
+    # _normalize_clip_gpu always rescales first, then normalizes
     normalized_batch = _normalize_clip_gpu(batch_tensor, device)
     
     if perf_stats is not None:
