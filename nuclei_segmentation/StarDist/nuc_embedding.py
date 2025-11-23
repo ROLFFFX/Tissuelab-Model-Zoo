@@ -2554,10 +2554,11 @@ class NucleiEmbedding:
                         # Keep as float32 for numerical consistency with original implementation
                         batch_embeddings = batch_embeddings.to(dtype=torch.float32)
                         
-                        # OPTIMIZATION: Normalize on GPU before moving to CPU (faster)
-                        # Use torch.nn.functional.normalize for optimized GPU implementation
-                        # This is equivalent to: embeddings / ||embeddings|| but more efficient
-                        batch_embeddings = torch.nn.functional.normalize(batch_embeddings, p=2, dim=1)
+                        # L2 normalization: embeddings / ||embeddings|| (matches dae510c behavior)
+                        # Avoid division by zero for zero vectors (same as CPU path)
+                        norms = torch.norm(batch_embeddings, dim=1, keepdim=True)
+                        norms = torch.where(norms > 0, norms, torch.ones_like(norms))
+                        batch_embeddings = batch_embeddings / norms
                         
                         # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
                         if torch.cuda.is_available():
