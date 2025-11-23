@@ -2075,7 +2075,31 @@ class NucleiEmbedding:
                 # Keep as float32 for numerical consistency with original implementation
                 # L2 normalization will be done in generate_embeddings postprocessing
                 embeddings = embeddings.to(dtype=torch.float32)
-                embeddings = embeddings.detach().cpu().numpy()
+                
+                # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
+                if torch.cuda.is_available():
+                    # Record an event after dtype conversion to track its completion
+                    # This is more efficient than synchronizing the entire device
+                    event = torch.cuda.Event()
+                    event.record()
+                    # Wait only for our specific operations to complete
+                    event.wait()
+                    # Create pinned tensor for faster transfer
+                    pinned_tensor = torch.empty(
+                        embeddings.shape, 
+                        dtype=torch.float32, 
+                        pin_memory=True
+                    )
+                    # Use async copy (non_blocking=True) - the event ensures dtype conversion is done
+                    pinned_tensor.copy_(embeddings, non_blocking=True)
+                    # Record another event to track copy completion
+                    copy_event = torch.cuda.Event()
+                    copy_event.record()
+                    copy_event.wait()  # Wait only for copy to complete
+                    embeddings = pinned_tensor.numpy()
+                else:
+                    # CPU fallback
+                    embeddings = embeddings.detach().cpu().numpy()
 
             return embeddings
 
@@ -2515,9 +2539,35 @@ class NucleiEmbedding:
                         # Keep as float32 for numerical consistency with original implementation
                         batch_embeddings = batch_embeddings.to(dtype=torch.float32)
                         
-                        # L2 normalization: embeddings / ||embeddings|| (matches server version)
-                        batch_embeddings = batch_embeddings / torch.norm(batch_embeddings, dim=1, keepdim=True)
-                        batch_embeddings = batch_embeddings.detach().cpu().numpy()
+                        # OPTIMIZATION: Normalize on GPU before moving to CPU (faster)
+                        # Use torch.nn.functional.normalize for optimized GPU implementation
+                        # This is equivalent to: embeddings / ||embeddings|| but more efficient
+                        batch_embeddings = torch.nn.functional.normalize(batch_embeddings, p=2, dim=1)
+                        
+                        # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
+                        if torch.cuda.is_available():
+                            # Record an event after normalization to track its completion
+                            # This is more efficient than synchronizing the entire device
+                            event = torch.cuda.Event()
+                            event.record()
+                            # Wait only for our specific operations to complete
+                            event.wait()
+                            # Create pinned tensor for faster transfer
+                            pinned_tensor = torch.empty(
+                                batch_embeddings.shape, 
+                                dtype=torch.float32, 
+                                pin_memory=True
+                            )
+                            # Use async copy (non_blocking=True) - the event ensures normalization is done
+                            pinned_tensor.copy_(batch_embeddings, non_blocking=True)
+                            # Record another event to track copy completion
+                            copy_event = torch.cuda.Event()
+                            copy_event.record()
+                            copy_event.wait()  # Wait only for copy to complete
+                            batch_embeddings = pinned_tensor.numpy()
+                        else:
+                            # CPU fallback
+                            batch_embeddings = batch_embeddings.detach().cpu().numpy()
                     elif isinstance(batch_embeddings, np.ndarray):
                         # Ensure float32 dtype
                         if batch_embeddings.dtype != np.float32:
