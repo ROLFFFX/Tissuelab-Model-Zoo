@@ -64,7 +64,7 @@ class NucleiPatchDataset(Dataset):
         }
         
         # Pre-compute bounding boxes from contours if available (very efficient - just numpy operations)
-        self.use_bounding_boxes = (contours is not None and len(contours) == len(centroids))
+        self.use_bounding_boxes = False
         if self.use_bounding_boxes:
             print(f"Using contour-based bounding boxes for patch extraction (padding: {padding_ratio*100}%)")
             self._compute_bounding_boxes()
