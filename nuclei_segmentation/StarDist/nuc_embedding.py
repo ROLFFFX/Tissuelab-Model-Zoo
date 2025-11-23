@@ -2589,10 +2589,7 @@ class NucleiEmbedding:
                             batch_embeddings = batch_embeddings.astype(np.float32, copy=False)
                         
                         # L2 normalization: embeddings / ||embeddings|| (matches server version)
-                        # Avoid division by zero for zero vectors (same as z-stack fusion code)
-                        norms = np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
-                        norms = np.where(norms > 0, norms, 1)  # Avoid division by zero
-                        batch_embeddings = batch_embeddings / norms
+                        batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
                     perf_stats['postprocessing_time'] += time.time() - postprocess_start
                     
                     # I/O operations
