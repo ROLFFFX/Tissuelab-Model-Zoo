@@ -1216,9 +1216,12 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
     
     preprocess_start = time.time()
     
-    # Convert PIL Images to numpy arrays and ensure uint8 format
-    numpy_images = []
+    # Process images: convert to numpy arrays if needed, then to tensors
+    # OPTIMIZATION: If input is already numpy array with correct format, avoid unnecessary conversions
+    processed_tensors = []
+    
     for img in images:
+        # Convert to numpy array if needed
         if isinstance(img, Image.Image):
             # Convert PIL to numpy (H, W, C)
             arr = np.array(img, dtype=np.uint8)
@@ -1229,7 +1232,12 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
             elif arr.shape[2] > 3:
                 arr = arr[:, :, :3]
         elif isinstance(img, np.ndarray):
-            arr = img.astype(np.uint8) if img.dtype != np.uint8 else img
+            # If already numpy array, only convert dtype if needed
+            if img.dtype != np.uint8:
+                arr = img.astype(np.uint8)
+            else:
+                arr = img  # No copy needed if dtype is already uint8
+            # Ensure correct shape
             if len(arr.shape) == 2:
                 arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
             elif arr.shape[2] == 1:
@@ -1238,15 +1246,18 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
                 arr = arr[:, :, :3]
         else:
             raise ValueError(f"Unsupported image type: {type(img)}")
-        numpy_images.append(arr)
-    
-    # Stack into batch (N, H, W, C) - handle variable sizes
-    # We'll process each image individually for resize/crop, then stack
-    processed_tensors = []
-    
-    for arr in numpy_images:
+        
         h, w = arr.shape[:2]
         
+        # OPTIMIZATION: For 224x224 images (most common case), skip resize and go directly to GPU
+        if h == target_size and w == target_size:
+            # Already correct size, convert directly to tensor and move to GPU
+            # This is the fast path for the most common case
+            img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device)
+            processed_tensors.append(img_tensor.squeeze(0))  # Remove batch dim: (C, H, W)
+            continue
+        
+        # For non-224x224 images, need resize/crop
         # Convert to tensor and move to GPU (H, W, C) -> (1, C, H, W)
         img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device)
         
