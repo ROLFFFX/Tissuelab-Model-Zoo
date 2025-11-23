@@ -1211,10 +1211,6 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
     Returns:
         torch.Tensor of shape (N, C, H, W) with normalized float32 values
     """
-    import time
-    import numpy as np
-    from PIL import Image
-    
     if len(images) == 0:
         return torch.zeros((0, 3, target_size, target_size), device=device, dtype=torch.float32)
     
@@ -1330,8 +1326,6 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         - If return_uint8=True: uint8 values [0, 255] (not normalized)
         - If return_uint8=False: float32 normalized values (ready for model)
     """
-    import time
-    
     if use_torchvision:
         num_images = len(images)
         if num_images == 0:
@@ -1675,9 +1669,6 @@ def collate_patches(batch, processor=None, perf_stats=None, use_fast_preprocess=
         For z-stack: batch is [cell1_patches, cell2_patches, ...]
         where cell_patches = [z1_patch, z2_patch, ...]
     """
-    import time
-    import numpy as np
-    
     valid_items = [item for item in batch if item is not None]
     
     if len(valid_items) == 0:
